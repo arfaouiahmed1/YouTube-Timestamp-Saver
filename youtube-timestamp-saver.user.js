@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Timestamp Saver
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.0
 // @description  Remembers and restores your last watched position in YouTube videos with a beautiful UI
 // @author       Your Name
 // @match        https://www.youtube.com/*
@@ -16,102 +16,8 @@
 // @noframes
 // ==/UserScript==
 
-/**
- * YouTube Timestamp Saver
- * A userscript to save and restore video positions on YouTube
- * 
- * @version 1.3.1
- * @author Your Name
- * @license MIT
- */
-
 (function() {
     'use strict';
-
-    // Cache DOM queries and commonly used values
-    const DOM = {
-        video: null,
-        player: null,
-        container: null,
-        notification: null,
-        settings: null,
-        updateCache() {
-            this.video = document.querySelector('video') || null;
-            this.player = document.querySelector('#movie_player, ytd-player, .html5-video-player') || null;
-            this.container = document.querySelector('ytd-watch-flexy') || null;
-            return this;
-        }
-    };
-
-    // Performance optimization: Debounce function
-    const debounce = (func, wait) => {
-        let timeout;
-        return function executedFunction(...args) {
-            const later = () => {
-                clearTimeout(timeout);
-                func(...args);
-            };
-            clearTimeout(timeout);
-            timeout = setTimeout(later, wait);
-        };
-    };
-
-    // Performance optimization: Throttle function
-    const throttle = (func, limit) => {
-        let inThrottle;
-        return function executedFunction(...args) {
-            if (!inThrottle) {
-                func(...args);
-                inThrottle = true;
-                setTimeout(() => inThrottle = false, limit);
-            }
-        };
-    };
-
-    // Error handling wrapper
-    const safeExecute = async (operation, fallback = null) => {
-        try {
-            return await operation();
-        } catch (error) {
-            console.error(`[YT Timestamp] Error in ${operation.name}:`, error);
-            return fallback;
-        }
-    };
-
-    // Optimized debug logger with rate limiting
-    const debug = (() => {
-        const messageCache = new Map();
-        const suppressedMessages = new Map();
-        const HIGH_FREQUENCY = new Set(['Skipping', 'checking', 'Auto-save', 'Video state', 'No video', 'Loading', 'Trying', 'Processing']);
-        const IMPORTANT = new Set(['Timestamp saved', 'Manual save', 'Restoring', 'Welcome back', 'initialization', 'New video', 'Error', 'Failed']);
-
-        return (message, data = '') => {
-            if (!settings?.debugMode) return;
-
-            const now = Date.now();
-            const firstWord = message.split(' ')[0];
-            const isHighFreq = HIGH_FREQUENCY.has(firstWord);
-            const isImportant = IMPORTANT.has(firstWord);
-
-            if (isHighFreq && !isImportant) {
-                const lastTime = messageCache.get(firstWord) || 0;
-                if (now - lastTime < 3000) {
-                    suppressedMessages.set(firstWord, (suppressedMessages.get(firstWord) || 0) + 1);
-                    return;
-                }
-                const suppressed = suppressedMessages.get(firstWord) || 0;
-                if (suppressed > 0) {
-                    console.log(`[YT Timestamp] ${message} (+ ${suppressed} similar messages suppressed)`, data);
-                    suppressedMessages.set(firstWord, 0);
-                } else {
-                    console.log(`[YT Timestamp] ${message}`, data);
-                }
-                messageCache.set(firstWord, now);
-            } else {
-                console.log(`[YT Timestamp] ${message}`, data);
-            }
-        };
-    })();
 
     // Default settings
     const defaultSettings = {
@@ -190,199 +96,88 @@
         return mergedSettings;
     })();
 
-    // State management
-    const State = {
-        currentVideoId: '',
-        lastSaveTime: 0,
-        isNotificationShowing: false,
-        notificationQueue: [],
-        settingsHotkey: 'CTRL+SHIFT+S',
-        notificationContainer: null,
-        notificationTimeout: null,
-        notificationAnimationFrame: null,
-        cachedPlayer: null,
-        lastPlayerRect: null,
-        resizeDebounceTimeout: null,
+    // Optimized debug logger with rate limiting for high-frequency messages
+    const debug = (message, data) => {
+        if (!settings?.debugMode) return;
         
-        // Video state tracking
-        videoState: {
-            lastTime: 0,
-            isPaused: true,
-            duration: 0,
-            title: ''
-        },
+        // Use static properties for tracking message frequency
+        debug.messageCounter = debug.messageCounter || new Map();
+        debug.lastLogTime = debug.lastLogTime || new Map();
+        debug.messageGroups = debug.messageGroups || {
+            // Group similar messages for tracking
+            highFrequency: [
+                'Skipping', 'checking', 'Auto-save', 'Video state',
+                'No video', 'Loading', 'Trying', 'Processing'
+            ],
+            // Messages that should always be shown
+            important: [
+                'Timestamp saved', 'Manual save', 'Restoring', 'Welcome back',
+                'initialization', 'New video', 'Error', 'Failed'
+            ]
+        };
         
-        // Update video state
-        updateVideoState() {
-            if (!DOM.video) return false;
+        // Get message category based on content
+        const getMessageCategory = (msg) => {
+            const firstWord = msg.split(' ')[0];
             
-            const newState = {
-                lastTime: Math.floor(DOM.video.currentTime || 0),
-                isPaused: DOM.video.paused,
-                duration: DOM.video.duration || 0,
-                title: document.title.replace(' - YouTube', '')
-            };
-            
-            // Check if state actually changed
-            const hasChanged = Object.entries(newState).some(
-                ([key, value]) => this.videoState[key] !== value
+            // Check if it's a high frequency message
+            const isHighFreq = debug.messageGroups.highFrequency.some(
+                term => msg.includes(term)
             );
             
-            if (hasChanged) {
-                Object.assign(this.videoState, newState);
-                return true;
-            }
-            return false;
-        },
+            // Check if it's an important message that should always show
+            const isImportant = debug.messageGroups.important.some(
+                term => msg.includes(term)
+            );
+            
+            // Return the appropriate category key
+            if (isImportant) return 'important';
+            if (isHighFreq) return firstWord || 'highFreq';
+            return firstWord || 'other';
+        };
         
-        // Reset state for new video
-        reset() {
-            this.currentVideoId = '';
-            this.lastSaveTime = 0;
-            this.videoState = {
-                lastTime: 0,
-                isPaused: true,
-                duration: 0,
-                title: ''
-            };
-            return this;
+        // Determine if message should be throttled
+        const now = Date.now();
+        const category = getMessageCategory(message);
+        const isHighFrequency = category !== 'important' && category !== 'other';
+        
+        if (isHighFrequency) {
+            const lastTime = debug.lastLogTime.get(category) || 0;
+            const counter = debug.messageCounter.get(category) || 0;
+            
+            // High frequency messages: throttle to max once per 3 seconds
+            if (now - lastTime < 3000) {
+                debug.messageCounter.set(category, counter + 1);
+                return; // Skip logging this message
+            } else {
+                // Log with count if we suppressed messages
+                const suppressedCount = debug.messageCounter.get(category) || 0;
+                if (suppressedCount > 0) {
+                    console.log(`[YT Timestamp] ${message} (+ ${suppressedCount} similar messages suppressed)`);
+                    debug.messageCounter.set(category, 0);
+                } else {
+                    console.log(`[YT Timestamp] ${message}`, data || '');
+                }
+                debug.lastLogTime.set(category, now);
+            }
+        } else {
+            // Normal logging for regular or important messages
+            console.log(`[YT Timestamp] ${message}`, data || '');
         }
     };
 
-    // Timestamp storage manager
-    const TimestampManager = {
-        async save(videoId, time, force = false) {
-            if (!videoId || isNaN(time) || time < 0) {
-                debug('Invalid save parameters', { videoId, time });
-                return false;
-            }
-
-            try {
-                const now = Date.now();
-                const timestamps = await safeExecute(() => GM_getValue('timestamps', {}));
-                const lastSave = timestamps[videoId]?.savedAt || 0;
-                const timeSinceLastSave = (now - lastSave) / 1000;
-
-                // Handle save conditions
-                if (!force) {
-                    // Skip if video is paused and saveOnPause is disabled
-                    if (State.videoState.isPaused && !settings.saveOnPause) {
-                        debug('Skipping save - video is paused');
-                        return false;
-                    }
-
-                    // Throttle frequent saves
-                    if (timeSinceLastSave < settings.minSaveInterval) {
-                        debug('Skipping save - too soon since last save');
-                        return false;
-                    }
-                }
-
-                // Storage management
-                const timestampEntries = Object.entries(timestamps);
-                if (timestampEntries.length >= settings.maxStoredTimestamps) {
-                    debug('Cleaning up old timestamps');
-                    const sortedEntries = timestampEntries
-                        .sort((a, b) => b[1].savedAt - a[1].savedAt)
-                        .slice(0, settings.maxStoredTimestamps - 1);
-                    
-                    Object.assign(timestamps, Object.fromEntries(sortedEntries));
-                }
-
-                // Save new timestamp
-                timestamps[videoId] = {
-                    time: time,
-                    savedAt: now,
-                    title: State.videoState.title,
-                    duration: State.videoState.duration
-                };
-
-                await safeExecute(() => GM_setValue('timestamps', timestamps));
-                State.lastSaveTime = now;
-
-                // Show notifications based on settings
-                if (force) {
-                    showNotification(`Saved at ${formatTime(time)}`, '💾');
-                } else if (settings.notifyOnAutoSave) {
-                    showNotification(`Auto-saved at ${formatTime(time)}`, '⚡');
-                }
-
-                debug(`${force ? 'Manual' : 'Auto'} save for ${videoId} at ${formatTime(time)}`);
-                return true;
-            } catch (error) {
-                console.error('Error saving timestamp:', error);
-                return false;
-            }
-        },
-
-        async load(videoId) {
-            if (!videoId) return null;
-
-            try {
-                const timestamps = await safeExecute(() => GM_getValue('timestamps', {}));
-                const savedData = timestamps[videoId];
-
-                if (!savedData) {
-                    debug(`No saved timestamp found for ${videoId}`);
-                    return null;
-                }
-
-                debug(`Found saved timestamp for ${videoId}: ${formatTime(savedData.time)}`);
-
-                if (settings.smartTimestampHandling) {
-                    const urlParams = new URLSearchParams(window.location.search);
-                    const urlTime = urlParams.get('t');
-
-                    if (urlTime) {
-                        const timeMatch = urlTime.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/);
-                        if (timeMatch) {
-                            const [, hours = 0, minutes = 0, seconds = 0] = timeMatch;
-                            const urlTimeSeconds = (parseInt(hours) * 3600) + (parseInt(minutes) * 60) + parseInt(seconds);
-
-                            if (Math.abs(urlTimeSeconds - savedData.time) > 30) {
-                                debug(`Using URL timestamp (${formatTime(urlTimeSeconds)}) instead of saved position`);
-                                if (settings.restoreNotifications) {
-                                    showNotification('Using URL timestamp instead of saved position', '🔄');
-                                }
-                                return { time: urlTimeSeconds, savedAt: Date.now() };
-                            }
-                        }
-                    }
-                }
-
-                // Check if saved position is near the end
-                if (savedData.duration && savedData.time > savedData.duration - 30) {
-                    if (settings.restoreNotifications) {
-                        showNotification('Starting from beginning (previous position was near end)', '🔄');
-                    }
-                    return { time: 0, savedAt: Date.now() };
-                }
-
-                return savedData;
-            } catch (error) {
-                console.error('Error loading timestamp:', error);
-                return null;
-            }
-        },
-
-        async delete(videoId) {
-            if (!videoId) return false;
-
-            try {
-                const timestamps = await safeExecute(() => GM_getValue('timestamps', {}));
-                if (timestamps[videoId]) {
-                    delete timestamps[videoId];
-                    await safeExecute(() => GM_setValue('timestamps', timestamps));
-                    debug(`Deleted timestamp for ${videoId}`);
-                    return true;
-                }
-                return false;
-            } catch (error) {
-                console.error('Error deleting timestamp:', error);
-                return false;
-            }
-        }
-    };
+    // Global state variables
+    let currentVideoId = '';
+    let lastSaveTime = 0;
+    let isNotificationShowing = false;
+    const notificationQueue = [];
+    let settingsHotkey = 'CTRL+SHIFT+S'; // Default hotkey for opening settings
+    let notificationContainer = null; // Cache for notification container
+    let notificationTimeout = null; // Store timeout reference
+    let notificationAnimationFrame = null; // Store animation frame reference
+    let cachedPlayer = null; // Cache player reference
+    let lastPlayerRect = null; // Cache player dimensions
+    let resizeDebounceTimeout = null; // For debouncing resize events
 
     // Update styles
     const styles = `
@@ -1802,6 +1597,12 @@
             background: rgba(0, 0, 0, 0.08);
         }
 
+        .yt-timestamp-settings.light .theme-option.active {
+            background: rgba(0, 0, 0, 0.08);
+            border-color: var(--primary-color);
+        }
+
+        /* Timestamp Format */
         .yt-timestamp-settings.light .format-option {
             background: rgba(0, 0, 0, 0.04);
         }
@@ -2272,6 +2073,891 @@
         }
 
         return videoId;
+    };
+
+    const saveTimestamp = (videoId, time, force = false) => {
+        if (!videoId) return;
+
+        const timestamps = GM_getValue('timestamps', {});
+        const now = Date.now();
+        const lastSave = timestamps[videoId]?.savedAt || 0;
+        const timeSinceLastSave = (now - lastSave)/1000;
+        const video = document.querySelector('video');
+
+        // Handle paused video conditions
+        if (!force && video && video.paused) {
+            if (settings.saveOnPause) {
+                debug('Video paused, saving position');
+                force = true; // Force save on pause
+            } else {
+                debug('Skipping save - video is paused');
+                return;
+            }
+        }
+
+        // Throttle frequent saves
+        if (!force && now - lastSave < settings.minSaveInterval * 1000) {
+            return;
+        }
+
+        // Validate time value
+        if (isNaN(time) || time < 0) {
+            debug('Invalid time value, skipping save');
+            return;
+        }
+
+        // Storage management - clean up old timestamps if exceeding limit
+        const timestampEntries = Object.entries(timestamps);
+        if (timestampEntries.length >= settings.maxStoredTimestamps) {
+            debug(`Cleaning up timestamps - ${timestampEntries.length} exceeds limit of ${settings.maxStoredTimestamps}`);
+            const sortedEntries = timestampEntries.sort((a, b) => b[1].savedAt - a[1].savedAt);
+            const newTimestamps = Object.fromEntries(sortedEntries.slice(0, settings.maxStoredTimestamps - 1));
+            GM_setValue('timestamps', newTimestamps);
+            
+            // Show cleanup notification
+            if (force) {
+                showNotification('Cleaned up old timestamps to make space', '🧹');
+                setTimeout(() => saveTimestamp(videoId, time, force), 1500);
+            } else {
+                saveTimestamp(videoId, time, force);
+            }
+            return;
+        }
+
+        // Save the timestamp
+        timestamps[videoId] = {
+            time: time,
+            savedAt: now,
+            title: document.title.replace(' - YouTube', ''),
+            duration: video?.duration || 0
+        };
+
+        GM_setValue('timestamps', timestamps);
+        
+        // Log with appropriate message type
+        const saveSource = force ? 'Manual save' : 'Auto-save';
+        debug(`${saveSource} for ${videoId} at ${formatTime(time)}`);
+
+        // Show notifications based on settings and context
+        if (force) {
+            showNotification(`Saved at ${formatTime(time)}`, '💾');
+        } else if (settings.notifyOnAutoSave) {
+            showNotification(`Auto-saved at ${formatTime(time)}`, '⚡');
+        }
+    };
+
+    const loadTimestamp = (videoId) => {
+        if (!videoId) return null;
+
+        const timestamps = GM_getValue('timestamps', {});
+        const savedData = timestamps[videoId];
+
+        if (!savedData) {
+            debug(`No saved timestamp found for ${videoId}`);
+            return null;
+        }
+
+        debug(`Found saved timestamp for ${videoId}: ${formatTime(savedData.time)}`);
+
+        if (settings.smartTimestampHandling) {
+            const urlParams = new URLSearchParams(window.location.search);
+            const urlTime = urlParams.get('t');
+
+            if (urlTime) {
+                const timeMatch = urlTime.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/);
+                if (timeMatch) {
+                    const [, hours = 0, minutes = 0, seconds = 0] = timeMatch;
+                    const urlTimeSeconds = (parseInt(hours) * 3600) + (parseInt(minutes) * 60) + parseInt(seconds);
+
+                    // Only use URL time if significantly different from saved time
+                    if (Math.abs(urlTimeSeconds - savedData.time) > 30) {
+                        debug(`Using URL timestamp (${formatTime(urlTimeSeconds)}) instead of saved position (${formatTime(savedData.time)})`);
+                        if (settings.restoreNotifications) {
+                            showNotification('Using URL timestamp instead of saved position', '🔄');
+                        }
+                        return { time: urlTimeSeconds, savedAt: Date.now() };
+                    }
+                }
+            }
+        }
+
+        // Check if saved position is near the end of video
+        const video = document.querySelector('video');
+        if (video && savedData.duration && savedData.time > savedData.duration - 30) {
+            if (settings.restoreNotifications) {
+                showNotification('Starting from beginning (previous position was near end)', '🔄');
+            }
+            return { time: 0, savedAt: Date.now() };
+        }
+
+        return savedData;
+    };
+
+    // UI Functions
+    const getOrCreateNotificationContainer = () => {
+        // If container exists and is in the DOM, verify it's properly structured
+        if (notificationContainer && document.body.contains(notificationContainer)) {
+            debug('Existing notification container found');
+            
+            // Verify the container has all required elements
+            const contentDiv = notificationContainer.querySelector('.notification-content');
+            const progressBar = notificationContainer.querySelector('.notification-progress');
+            
+            if (!contentDiv || !progressBar) {
+                debug('Notification container missing required elements, recreating');
+                try {
+                    notificationContainer.parentNode.removeChild(notificationContainer);
+                } catch (e) {
+                    // Ignore errors if already detached
+                }
+                notificationContainer = null;
+            } else {
+                // Update dark mode state for existing container
+                const useDarkMode = getDarkModeState();
+                updateNotificationTheme(notificationContainer, useDarkMode);
+            return notificationContainer;
+            }
+        } else if (notificationContainer) {
+            debug('Notification container exists but is detached from DOM');
+            notificationContainer = null;
+        }
+
+        debug('Creating new notification container');
+        
+        try {
+            const containerId = 'yt-timestamp-notification-' + Date.now();
+        notificationContainer = document.createElement('div');
+            notificationContainer.id = containerId;
+
+            // Get dark mode state
+            const useDarkMode = getDarkModeState();
+
+            // Set classes and initial styling
+            notificationContainer.className = `yt-timestamp-notification ${useDarkMode ? 'dark' : 'light'}`;
+
+            // Create content div
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'notification-content';
+            contentDiv.style.display = 'flex';
+            contentDiv.style.alignItems = 'center';
+            contentDiv.style.gap = '8px';
+            contentDiv.style.padding = '10px 12px';
+            contentDiv.style.position = 'relative';
+            contentDiv.style.width = 'fit-content';
+            contentDiv.style.maxWidth = '100%';
+            contentDiv.style.willChange = 'transform, opacity';
+            notificationContainer.appendChild(contentDiv);
+
+            // Create progress bar
+            const progressBar = document.createElement('div');
+            progressBar.className = 'notification-progress';
+            progressBar.style.background = settings.customAccentColor;
+            progressBar.style.height = '2px';
+            progressBar.style.position = 'absolute';
+            progressBar.style.bottom = '0';
+            progressBar.style.left = '0';
+            progressBar.style.right = '0';
+            progressBar.style.opacity = '0.8';
+            progressBar.style.transform = 'translateZ(0)';
+            progressBar.style.willChange = 'width, opacity';
+            progressBar.style.borderBottomLeftRadius = '6px';
+            progressBar.style.borderBottomRightRadius = '6px';
+            notificationContainer.appendChild(progressBar);
+
+            // Apply modern styling with better aesthetics
+            const darkModeStyles = {
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4), 0 0 1px rgba(0, 0, 0, 0.3)',
+                border: '1px solid rgba(255, 255, 255, 0.08)',
+                backgroundColor: 'rgba(32, 32, 32, 0.94)',
+                color: 'rgba(255, 255, 255, 0.95)'
+            };
+
+            const lightModeStyles = {
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15), 0 0 1px rgba(0, 0, 0, 0.1)',
+                border: '1px solid rgba(0, 0, 0, 0.08)',
+                backgroundColor: 'rgba(255, 255, 255, 0.96)',
+                color: 'rgba(0, 0, 0, 0.9)'
+            };
+
+            Object.assign(notificationContainer.style, {
+                opacity: '0',
+                pointerEvents: 'none',
+                zIndex: '9999999',
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+                width: 'fit-content',
+                maxWidth: 'min(90vw, 400px)',
+                position: 'fixed',
+                borderRadius: '6px',
+                transform: 'translateZ(0) translateY(-10px) scale(0.96)',
+                transition: 'all 0.2s cubic-bezier(0.2, 0, 0, 1)',
+                backdropFilter: 'blur(10px)',
+                webkitBackdropFilter: 'blur(10px)',
+                ...(useDarkMode ? darkModeStyles : lightModeStyles)
+            });
+            
+            // Set size based on settings
+            if (settings.notificationSize === 'small') {
+                notificationContainer.style.fontSize = '11px';
+            } else if (settings.notificationSize === 'large') {
+                notificationContainer.style.fontSize = '14px';
+            } else {
+                notificationContainer.style.fontSize = '13px';
+            }
+            
+            // Remove any existing containers with the same ID
+            const existingContainer = document.getElementById(containerId);
+            if (existingContainer) {
+                try {
+                    existingContainer.parentNode.removeChild(existingContainer);
+                } catch (e) {
+                    // Ignore errors
+                }
+            }
+            
+            // Append to body
+        document.body.appendChild(notificationContainer);
+            
+            // Ensure container was actually added to the DOM
+            if (!document.body.contains(notificationContainer)) {
+                debug('Error: Container failed to append to body, trying alternative method');
+                document.body.insertAdjacentElement('beforeend', notificationContainer);
+                
+                if (!document.body.contains(notificationContainer)) {
+                    debug('Critical error: Notification container could not be added to DOM');
+                    return null;
+                }
+            }
+
+            // Add theme change listener
+            addThemeChangeListener(notificationContainer);
+            
+            debug(`Notification container created with ID: ${containerId}`);
+        return notificationContainer;
+        } catch (error) {
+            console.error('Error creating notification container:', error);
+            return null;
+        }
+    };
+
+    // Helper function to get dark mode state
+    const getDarkModeState = () => {
+        if (settings.themeMode === 'light') {
+            return false;
+        } else if (settings.themeMode === 'system') {
+            return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        }
+        return true; // Default to dark mode
+    };
+
+    // Helper function to update notification theme
+    const updateNotificationTheme = (notification, isDark) => {
+        if (!notification) return;
+
+        // Update class
+        notification.className = `yt-timestamp-notification ${isDark ? 'dark' : 'light'}`;
+
+        // Update styles
+        const themeStyles = isDark ? {
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4), 0 0 1px rgba(0, 0, 0, 0.3)',
+            border: '1px solid rgba(255, 255, 255, 0.08)',
+            backgroundColor: 'rgba(32, 32, 32, 0.94)',
+            color: 'rgba(255, 255, 255, 0.95)'
+        } : {
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15), 0 0 1px rgba(0, 0, 0, 0.1)',
+            border: '1px solid rgba(0, 0, 0, 0.08)',
+            backgroundColor: 'rgba(255, 255, 255, 0.96)',
+            color: 'rgba(0, 0, 0, 0.9)'
+        };
+
+        Object.assign(notification.style, themeStyles);
+
+        // Update close button colors if present
+        const closeButton = notification.querySelector('.notification-close');
+        if (closeButton) {
+            closeButton.addEventListener('mouseover', () => {
+                closeButton.style.backgroundColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
+            });
+            closeButton.addEventListener('mouseout', () => {
+                closeButton.style.backgroundColor = 'transparent';
+            });
+        }
+
+        // Update emoji container background
+        const emojiContainer = notification.querySelector('.notification-emoji-container');
+        if (emojiContainer) {
+            emojiContainer.style.background = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.06)';
+        }
+    };
+
+    // Helper function to add theme change listener
+    const addThemeChangeListener = (notification) => {
+        if (settings.themeMode === 'system') {
+            const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+            const themeChangeHandler = (e) => {
+                updateNotificationTheme(notification, e.matches);
+            };
+            
+            // Add listener and store reference for cleanup
+            mediaQuery.addListener(themeChangeHandler);
+            notification.themeChangeHandler = themeChangeHandler;
+            notification.mediaQuery = mediaQuery;
+        }
+    };
+
+    // Position the notification based on settings and screen size
+    const updateNotificationPosition = (notification) => {
+        if (!notification) return;
+
+        try {
+            // Clear any styles from previous positioning
+            notification.style.top = '';
+            notification.style.right = '';
+            notification.style.bottom = '';
+            notification.style.left = '';
+            notification.style.transform = '';
+            
+            // Enhanced video and player detection
+            const video = document.querySelector('video');
+            const playerElement = document.querySelector('#movie_player, ytd-player, .html5-video-player');
+            const playerContainer = document.querySelector('ytd-watch-flexy');
+            const theaterContainer = document.querySelector('ytd-watch-flexy[theater] #player-container');
+            
+            // Detect various player states
+            const states = {
+                isVideoPresent: !!video,
+                isVideoPlaying: video && !video.paused && !video.ended && video.currentTime > 0,
+                isFullscreen: document.fullscreenElement || document.webkitFullscreenElement,
+                isTheaterMode: !!document.querySelector('ytd-watch-flexy[theater]'),
+                isMiniPlayer: !!document.querySelector('.ytp-miniplayer-ui')
+            };
+
+            debug(`Positioning notification - States:`, states);
+
+            // Get current state's position settings
+            const stateSettings = states.isVideoPlaying ? 
+                settings.notificationPosition.duringPlayback : 
+                settings.notificationPosition.onHomepage;
+
+            // Get position and margin from state settings
+            const position = stateSettings.position;
+            const baseMargin = stateSettings.margin;
+
+            // Calculate responsive margins based on screen size and state margin
+            const margin = {
+                normal: baseMargin,
+                fullscreen: Math.max(baseMargin, window.innerWidth * 0.02),
+                safety: baseMargin * 0.5
+            };
+
+            // If no video or player is detected, use top-left position with padding
+            if (!states.isVideoPresent || !playerElement) {
+                debug('No video detected, using default top-left position');
+                notification.style.top = `${margin.normal}px`;
+                notification.style.left = `${margin.normal}px`;
+                return;
+            }
+            
+            // Get player dimensions
+            const playerRect = playerElement.getBoundingClientRect();
+            const containerRect = playerContainer?.getBoundingClientRect() || playerRect;
+            
+            // Handle fullscreen mode
+            if (states.isFullscreen) {
+                debug('Positioning for fullscreen video');
+                applyFullscreenPosition(notification, position, margin.fullscreen);
+                return;
+            }
+
+            // Handle theater mode
+            if (states.isTheaterMode && theaterContainer) {
+                debug('Positioning for theater mode');
+                const theaterRect = theaterContainer.getBoundingClientRect();
+                applyTheaterPosition(notification, position, theaterRect, margin.normal);
+                return;
+            }
+
+            // Handle mini player
+            if (states.isMiniPlayer) {
+                debug('Positioning for mini player');
+                notification.style.top = `${margin.normal}px`;
+                notification.style.right = `${margin.normal}px`;
+                return;
+            }
+
+            // Standard positioning relative to player
+            debug('Applying standard positioning');
+            applyStandardPosition(notification, position, playerRect, containerRect, margin.normal);
+
+            // Ensure notification stays within viewport bounds
+        requestAnimationFrame(() => {
+            const notificationRect = notification.getBoundingClientRect();
+                const viewportAdjustment = ensureInViewport(notificationRect, margin.safety);
+                
+                Object.entries(viewportAdjustment).forEach(([property, value]) => {
+                    if (value !== null) {
+                        notification.style[property] = value;
+                    }
+                });
+
+                // Fix transform property if needed
+                fixTransformProperty(notification);
+            });
+
+        } catch (error) {
+            console.error('Error updating notification position:', error);
+            // Fallback to safe position
+            notification.style.top = `${margin.normal}px`;
+            notification.style.left = `${margin.normal}px`;
+        }
+    };
+
+    // Helper function for fullscreen positioning
+    const applyFullscreenPosition = (notification, position, margin) => {
+        const positions = {
+            'top-left': { top: margin, left: margin },
+            'top-center': { top: margin, left: '50%', transform: 'translateX(-50%)' },
+            'top-right': { top: margin, right: margin },
+            'center-left': { top: '50%', left: margin, transform: 'translateY(-50%)' },
+            'center-center': { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' },
+            'center-right': { top: '50%', right: margin, transform: 'translateY(-50%)' },
+            'bottom-left': { bottom: margin, left: margin },
+            'bottom-center': { bottom: margin, left: '50%', transform: 'translateX(-50%)' },
+            'bottom-right': { bottom: margin, right: margin }
+        };
+
+        const pos = positions[position] || positions['top-right'];
+        Object.entries(pos).forEach(([prop, value]) => {
+            notification.style[prop] = typeof value === 'number' ? `${value}px` : value;
+        });
+    };
+
+    // Helper function for theater mode positioning
+    const applyTheaterPosition = (notification, position, theaterRect, margin) => {
+        const positions = {
+            'top-left': { top: theaterRect.top + margin, left: theaterRect.left + margin },
+            'top-center': { top: theaterRect.top + margin, left: theaterRect.left + (theaterRect.width / 2), transform: 'translateX(-50%)' },
+            'top-right': { top: theaterRect.top + margin, right: window.innerWidth - theaterRect.right + margin },
+            'center-left': { top: theaterRect.top + (theaterRect.height / 2), left: theaterRect.left + margin, transform: 'translateY(-50%)' },
+            'center-center': { top: theaterRect.top + (theaterRect.height / 2), left: theaterRect.left + (theaterRect.width / 2), transform: 'translate(-50%, -50%)' },
+            'center-right': { top: theaterRect.top + (theaterRect.height / 2), right: window.innerWidth - theaterRect.right + margin, transform: 'translateY(-50%)' },
+            'bottom-left': { bottom: window.innerHeight - theaterRect.bottom + margin, left: theaterRect.left + margin },
+            'bottom-center': { bottom: window.innerHeight - theaterRect.bottom + margin, left: theaterRect.left + (theaterRect.width / 2), transform: 'translateX(-50%)' },
+            'bottom-right': { bottom: window.innerHeight - theaterRect.bottom + margin, right: window.innerWidth - theaterRect.right + margin }
+        };
+
+        const pos = positions[position] || positions['top-right'];
+        Object.entries(pos).forEach(([prop, value]) => {
+            notification.style[prop] = typeof value === 'number' ? `${value}px` : value;
+        });
+    };
+
+    // Helper function for standard positioning
+    const applyStandardPosition = (notification, position, playerRect, containerRect, margin) => {
+        const positions = {
+            'top-left': { top: playerRect.top + margin, left: containerRect.left + margin },
+            'top-center': { top: playerRect.top + margin, left: containerRect.left + (containerRect.width / 2), transform: 'translateX(-50%)' },
+            'top-right': { top: playerRect.top + margin, right: window.innerWidth - containerRect.right + margin },
+            'center-left': { top: playerRect.top + (playerRect.height / 2), left: containerRect.left + margin, transform: 'translateY(-50%)' },
+            'center-center': { top: playerRect.top + (playerRect.height / 2), left: containerRect.left + (containerRect.width / 2), transform: 'translate(-50%, -50%)' },
+            'center-right': { top: playerRect.top + (playerRect.height / 2), right: window.innerWidth - containerRect.right + margin, transform: 'translateY(-50%)' },
+            'bottom-left': { bottom: window.innerHeight - playerRect.bottom + margin, left: containerRect.left + margin },
+            'bottom-center': { bottom: window.innerHeight - playerRect.bottom + margin, left: containerRect.left + (containerRect.width / 2), transform: 'translateX(-50%)' },
+            'bottom-right': { bottom: window.innerHeight - playerRect.bottom + margin, right: window.innerWidth - containerRect.right + margin }
+        };
+
+        const pos = positions[position] || positions['top-right'];
+        Object.entries(pos).forEach(([prop, value]) => {
+            notification.style[prop] = typeof value === 'number' ? `${value}px` : value;
+        });
+    };
+
+    // Helper function to ensure notification stays within viewport
+    const ensureInViewport = (rect, safetyMargin) => {
+        const adjustment = {
+            top: null,
+            right: null,
+            bottom: null,
+            left: null,
+            transform: null
+        };
+
+        if (rect.right > window.innerWidth - safetyMargin) {
+            adjustment.right = `${safetyMargin}px`;
+            adjustment.left = 'auto';
+            adjustment.transform = '';
+        }
+
+        if (rect.left < safetyMargin) {
+            adjustment.left = `${safetyMargin}px`;
+            adjustment.right = 'auto';
+            adjustment.transform = '';
+        }
+
+        if (rect.bottom > window.innerHeight - safetyMargin) {
+            adjustment.bottom = `${safetyMargin}px`;
+            adjustment.top = 'auto';
+        }
+
+        if (rect.top < safetyMargin) {
+            adjustment.top = `${safetyMargin}px`;
+            adjustment.bottom = 'auto';
+        }
+
+        return adjustment;
+    };
+
+    // Helper function to fix transform property
+    const fixTransformProperty = (notification) => {
+        const transform = notification.style.transform;
+        if (!transform) return;
+
+        if (transform.includes('translate(-50%,') && !transform.includes('translateY(-50%)')) {
+            notification.style.transform = 'translateX(-50%)';
+        } else if (transform.includes('translate(') && !transform.includes('translate(-50%, -50%)')) {
+            notification.style.transform = transform
+                .replace('translate(', 'translateX(')
+                .replace(', -50%)', '');
+        }
+    };
+
+    // Show notification with improved reliability and modern aesthetics
+    const showNotification = (message, emoji, duration = settings.notificationDuration) => {
+        if (!message || !emoji) {
+            debug('Missing message or emoji for notification');
+            return Promise.reject(new Error('Missing message or emoji'));
+        }
+        
+        // Skip showing notification if notifications are disabled
+        if (!settings.enableNotifications) {
+            debug(`Notification suppressed (notifications disabled): ${message}`);
+            return Promise.reject(new Error('Notifications disabled'));
+        }
+
+        // Skip duplicate notifications within a short time
+        const notificationKey = `${message}:${emoji}`;
+        const now = Date.now();
+        const lastNotificationTime = showNotification.lastShownTimes?.get(notificationKey) || 0;
+        
+        if (now - lastNotificationTime < 1500) { // Prevent duplicate notifications within 1.5s
+            debug('Skipping duplicate notification');
+            return Promise.resolve(false);
+        }
+
+        // Update last shown time
+        showNotification.lastShownTimes = showNotification.lastShownTimes || new Map();
+        showNotification.lastShownTimes.set(notificationKey, now);
+        
+        debug(`Showing notification: ${message}`);
+        
+        // Return a promise to track success/failure
+        return new Promise((resolve, reject) => {
+            // Helper function to retry creating the notification if needed
+            const showNotificationWithRetry = (retryCount = 0, maxRetries = 3) => {
+            // Cancel any existing notification timers
+            if (notificationTimeout) {
+                clearTimeout(notificationTimeout);
+                notificationTimeout = null;
+            }
+
+            if (notificationAnimationFrame) {
+                cancelAnimationFrame(notificationAnimationFrame);
+                notificationAnimationFrame = null;
+            }
+
+            // Get or create the notification container
+            const notification = getOrCreateNotificationContainer();
+            
+            if (!notification) {
+                if (retryCount < maxRetries) {
+                    setTimeout(() => showNotificationWithRetry(retryCount + 1, maxRetries), 100);
+                } else {
+                    reject(new Error('Failed to create notification container'));
+                }
+                return;
+            }
+
+            const contentDiv = notification.querySelector('.notification-content');
+            if (!contentDiv) {
+                if (retryCount < maxRetries) {
+                    setTimeout(() => showNotificationWithRetry(retryCount + 1, maxRetries), 100);
+                } else {
+                    reject(new Error('Failed to find content div'));
+                }
+                return;
+            }
+
+            // Clear existing content
+            while (contentDiv.firstChild) {
+                contentDiv.removeChild(contentDiv.firstChild);
+            }
+
+                // Create emoji container with enhanced styling
+                const emojiContainer = document.createElement('div');
+                emojiContainer.className = 'notification-emoji-container';
+                emojiContainer.style.display = 'flex';
+                emojiContainer.style.alignItems = 'center';
+                emojiContainer.style.justifyContent = 'center';
+                emojiContainer.style.flexShrink = '0';
+                emojiContainer.style.borderRadius = '50%';
+                emojiContainer.style.width = '22px';
+                emojiContainer.style.height = '22px';
+                emojiContainer.style.background = 'rgba(255, 255, 255, 0.1)';
+                emojiContainer.style.marginRight = '4px';
+                
+                // Create emoji element with enhanced styling
+            const emojiSpan = document.createElement('span');
+            emojiSpan.className = 'notification-emoji';
+            emojiSpan.textContent = emoji;
+                emojiSpan.style.fontSize = '14px';
+                emojiSpan.style.lineHeight = '1';
+            emojiSpan.style.display = 'flex';
+            emojiSpan.style.alignItems = 'center';
+            emojiSpan.style.justifyContent = 'center';
+                emojiSpan.style.opacity = '0.95';
+            emojiSpan.style.transform = 'translateZ(0)'; // Force GPU acceleration
+            
+                emojiContainer.appendChild(emojiSpan);
+                
+                // Create content container for better layout
+                const textContainer = document.createElement('div');
+                textContainer.className = 'notification-text-container';
+                textContainer.style.display = 'flex';
+                textContainer.style.flexDirection = 'column';
+                textContainer.style.flexGrow = '1';
+                textContainer.style.minWidth = '0'; // Allow ellipsis to work
+                textContainer.style.gap = '2px';
+                
+                // Create message element with enhanced styling
+            const messageSpan = document.createElement('span');
+            messageSpan.className = 'notification-message';
+            messageSpan.textContent = message;
+            messageSpan.style.display = 'block';
+                messageSpan.style.fontWeight = '500';  // Slightly bolder
+                messageSpan.style.lineHeight = '1.2';
+            messageSpan.style.whiteSpace = 'nowrap';
+            messageSpan.style.overflow = 'hidden';
+            messageSpan.style.textOverflow = 'ellipsis';
+                messageSpan.style.opacity = '0.92';
+            messageSpan.style.transform = 'translateZ(0)'; // Force GPU acceleration
+                
+                textContainer.appendChild(messageSpan);
+                
+                // Determine if we should use dark mode for styling
+                let useDarkMode = true;
+                if (settings.themeMode === 'light') {
+                    useDarkMode = false;
+                } else if (settings.themeMode === 'system') {
+                    useDarkMode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                }
+            
+            // Add elements to content div
+                contentDiv.appendChild(emojiContainer);
+                contentDiv.appendChild(textContainer);
+                
+                // Add subtle close button
+                const closeButton = document.createElement('div');
+                closeButton.className = 'notification-close';
+                closeButton.textContent = '×';  // Using textContent instead of innerHTML
+                closeButton.style.fontSize = '16px';
+                closeButton.style.lineHeight = '16px';
+                closeButton.style.width = '16px';
+                closeButton.style.height = '16px';
+                closeButton.style.display = 'flex';
+                closeButton.style.alignItems = 'center';
+                closeButton.style.justifyContent = 'center';
+                closeButton.style.marginLeft = '6px';
+                closeButton.style.opacity = '0.5';
+                closeButton.style.cursor = 'pointer';
+                closeButton.style.borderRadius = '50%';
+                closeButton.style.transition = 'opacity 0.2s ease, background-color 0.2s ease';
+                
+                // Add hover effect
+                closeButton.addEventListener('mouseover', () => {
+                    closeButton.style.opacity = '0.8';
+                    closeButton.style.backgroundColor = useDarkMode ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
+                });
+                
+                closeButton.addEventListener('mouseout', () => {
+                    closeButton.style.opacity = '0.5';
+                    closeButton.style.backgroundColor = 'transparent';
+                });
+                
+                // Add click handler to dismiss notification
+                closeButton.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    hideNotification(notification, true);
+                });
+                
+                contentDiv.appendChild(closeButton);
+
+            // Position the notification before showing
+            updateNotificationPosition(notification);
+
+                // Show notification with enhanced animation
+            requestAnimationFrame(() => {
+                notification.style.display = 'flex';
+                notification.style.visibility = 'visible';
+                
+                // Force a reflow to ensure transition works
+                notification.offsetHeight;
+                
+                    // More sophisticated animation
+                notification.style.opacity = '1';
+                    notification.style.transform = 'translateZ(0) translateY(0) scale(1)';
+
+                    // Start progress bar animation
+                const progressBar = notification.querySelector('.notification-progress');
+                if (progressBar) {
+                        // Reset progress bar first
+                        progressBar.style.transition = 'none';
+                        progressBar.style.width = '100%';
+                        
+                        // Force reflow
+                        progressBar.offsetHeight;
+                        
+                        // Start animation
+                        progressBar.style.transition = `width ${duration}ms cubic-bezier(0.4, 0, 0.2, 1)`;
+                        progressBar.style.width = '0';
+                }
+
+                // Set hide timeout
+                notificationTimeout = setTimeout(() => {
+                        hideNotification(notification);
+                    }, duration);
+                    
+                    // Mark as resolved once shown
+                    resolve(true);
+                });
+            };
+            
+            // Helper function to hide the notification with animation
+            const hideNotification = (notification, immediate = false) => {
+                if (!notification) return;
+                
+                const transitionDuration = immediate ? 150 : 250;
+                
+                // Set transition duration (faster for immediate)
+                notification.style.transition = `all ${transitionDuration}ms cubic-bezier(0.4, 0, 0.2, 1)`;
+                
+                // Animate out
+                    notification.style.opacity = '0';
+                notification.style.transform = 'translateZ(0) translateY(-10px) scale(0.96)';
+                    
+                    // Clean up after transition
+                    setTimeout(() => {
+                        notification.style.display = 'none';
+                    
+                        // Reset progress bar
+                    const progressBar = notification.querySelector('.notification-progress');
+                        if (progressBar) {
+                            progressBar.style.transition = 'none';
+                            progressBar.style.width = '100%';
+                        }
+                }, transitionDuration);
+            };
+            
+            // Start the notification showing process
+            showNotificationWithRetry(0, 3);
+        });
+    };
+
+    // Debounced window resize handler
+    window.addEventListener('resize', () => {
+        if (resizeDebounceTimeout) {
+            clearTimeout(resizeDebounceTimeout);
+        }
+
+        resizeDebounceTimeout = setTimeout(() => {
+            if (notificationContainer && notificationContainer.classList.contains('show')) {
+                requestAnimationFrame(() => {
+                    updateNotificationPosition(notificationContainer);
+                });
+            }
+            // Also invalidate cached player rect
+            lastPlayerRect = null;
+        }, 100); // 100ms debounce
+    });
+
+    // Optimized player change observer
+    const observePlayerChanges = () => {
+        debug('Setting up player change detection');
+        
+        // Function to find player container reliably
+        const getPlayerContainer = () => {
+            return document.querySelector('#movie_player') || 
+                   document.querySelector('.html5-video-player');
+        };
+
+        const setupObserver = () => {
+            const playerContainer = getPlayerContainer();
+            if (!playerContainer) {
+                debug('Player container not found, will retry later');
+                return null;
+            }
+            
+            // Create mutation observer
+            const observer = new MutationObserver((mutations) => {
+                if (!settings.debugMode) return; // Skip processing if not in debug mode
+                
+                for (const mutation of mutations) {
+                    if (mutation.attributeName === 'class') {
+                        const target = mutation.target;
+                        const classes = target.className;
+                        
+                        if (classes.includes('playing')) {
+                            debug('Player state changed: playing');
+                        } else if (classes.includes('paused')) {
+                            debug('Player state changed: paused');
+                        }
+                    }
+                }
+            });
+            
+            // Start observing with optimized configuration
+            observer.observe(playerContainer, { 
+                attributes: true,
+                attributeFilter: ['class'], // Only observe class changes
+                subtree: false // Don't observe children
+            });
+            
+            debug('Player change observer initialized');
+            return observer;
+        };
+        
+        // Initial setup
+        let observer = setupObserver();
+        
+        // If player not ready, retry with increasing delays
+        if (!observer) {
+            let retryCount = 0;
+            const maxRetries = 5;
+            const retryInterval = 1000;
+            
+            const retrySetup = () => {
+                retryCount++;
+                debug(`Retrying player observer setup (${retryCount}/${maxRetries})`);
+                
+                observer = setupObserver();
+                if (!observer && retryCount < maxRetries) {
+                    setTimeout(retrySetup, retryInterval * retryCount);
+                }
+            };
+            
+            setTimeout(retrySetup, retryInterval);
+        }
+        
+        // Return cleanup function
+        return {
+            cleanup: () => {
+                if (observer) {
+                    observer.disconnect();
+                    observer = null;
+                    debug('Player observer cleaned up');
+                }
+            }
+        };
     };
 
     // Initialize the player observer once
